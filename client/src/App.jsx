@@ -8,8 +8,15 @@ import { io } from 'socket.io-client'
 const STATUS = { WON: 'Выиграна', LOST: 'Проиграна', PENDING: 'Нерасчитана' }
 const statusColor = (s) => s===STATUS.WON? 'bg-emerald-600' : s===STATUS.LOST? 'bg-rose-600' : 'bg-amber-500'
 
-// Валюта — всегда добавляем слово "рублей"
-const currency = (v) => `${v} рублей`
+// Формат до 2 знаков после запятой
+const fmt2 = (n) => {
+  const x = Number(n)
+  if (!isFinite(x)) return String(n ?? '')
+  return x.toLocaleString('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
+}
+
+// Валюта — добавляем "рублей" + формат до 2 знаков
+const currency = (v) => `${fmt2(v)} рублей`
 
 // Нормализуем результат ставки
 function normalizedWinValue(b){
@@ -51,7 +58,6 @@ async function fetchBets(){
   return await r.json()
 }
 
-// получить серверный штамп последнего обновления (независимо от браузера)
 async function fetchMeta(){
   try{
     const r = await fetch('/api/meta')
@@ -71,7 +77,6 @@ function useRealtimeBets(){
 
   useEffect(()=>{
     let mounted = true
-    // первичная загрузка: тянем список и серверный updatedAt
     fetchBets().then(d=> { if(mounted) setBets(d) })
     fetchMeta().then(ts=> { if(mounted && ts) setLastEventAt(ts) })
 
@@ -79,7 +84,6 @@ function useRealtimeBets(){
     socket.on('connect', ()=> setConnected(true))
     socket.on('disconnect', ()=> setConnected(false))
 
-    // поддержка старого и нового формата события
     socket.on('bets:update', (payload)=>{
       if(Array.isArray(payload)){
         setBets(payload)
@@ -136,10 +140,8 @@ function MobileHome(){
   const listRef = useRef(null)
   const prevFirstId = useRef('')
 
-  // summary carousel state
   const scrollerRef = useRef(null)
 
-  // короткая вспышка при любом апдейте + подсветка и автоскролл при добавлении новой первой
   useEffect(()=>{
     if(!lastEventAt) return
     setFlash(true)
@@ -155,7 +157,6 @@ function MobileHome(){
     return ()=> clearTimeout(t)
   }, [lastEventAt])
 
-  // вычисления
   const last15 = useMemo(()=> bets.slice(0, 15), [bets])
   const stats15 = useMemo(()=> calcStats(last15), [last15])
   const streak = useMemo(()=> calcStreak(bets), [bets])
@@ -164,7 +165,7 @@ function MobileHome(){
   const winrateTone = stats15.winRate > 50 ? 'green' : 'red'
   const profitTone = stats15.profit > 0 ? 'green' : (stats15.profit < 0 ? 'red' : 'neutral')
 
-  // Новая логика "обновлено": только два статуса
+  // Новая логика «обновлено»: только «только что» (≤30 мин) или «сегодня»
   const dateLabel = useMemo(()=>{
     const ts = Number(lastEventAt)||0
     if(!ts) return 'сегодня'
@@ -172,16 +173,14 @@ function MobileHome(){
     return delta <= 30*60*1000 ? 'только что' : 'сегодня'
   }, [lastEventAt])
 
-  // items for carousel
   const metricCards = [
     { key:'wr', title:'Винрейт', subtitle:'за последние 15 ставок', value:`${stats15.winRate}%`, tone:winrateTone },
-    { key:'pf', title:'Профит', subtitle:'за последние 15 ставок', value:`${stats15.profit} рублей`, tone:profitTone },
+    { key:'pf', title:'Профит', subtitle:'за последние 15 ставок', value:`${fmt2(stats15.profit)} рублей`, tone:profitTone },
     { key:'st', title:'Серия', subtitle:'за последние 15 ставок', value:`${streak.count} ${streak.kind}`, tone:(streak.kind==='побед'&&streak.count>0?'green':(streak.kind==='поражений'&&streak.count>0?'red':'neutral')) },
   ]
 
   return (
     <div className="min-h-screen bg-neutral-950 text-white flex flex-col">
-      {/* Branding + LIVE индикатор + дата обновления (сохраняется) */}
       <div className="px-4 pt-4 pb-2">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -201,7 +200,6 @@ function MobileHome(){
             className="text-xs px-3 py-2 rounded-xl bg-white/10 hover:bg-white/15 whitespace-nowrap"
           >t.me/betoff7</a>
         </div>
-        {/* бегущая линия под шапкой */}
         <motion.div
           className="mt-3 h-[2px] bg-gradient-to-r from-emerald-400/0 via-emerald-400/80 to-emerald-400/0"
           animate={{ x: [ '-100%', '100%' ] }}
@@ -209,7 +207,6 @@ function MobileHome(){
         />
       </div>
 
-      {/* Summary — горизонтальный слайдер c компактными карточками */}
       <div className="px-0 mb-1">
         <motion.div
           className="relative"
@@ -219,7 +216,7 @@ function MobileHome(){
           <div ref={scrollerRef} className="no-scrollbar overflow-x-auto snap-x snap-mandatory">
             <div className="flex gap-3 px-3">
               {metricCards.map((c)=> (
-                <div key={c.key} className="shrink-0 snap-start">
+                <div key={c.key} className="shrink-0 snap-center w-[78%] max-w-[360px]">
                   <SummaryCard title={c.title} subtitle={c.subtitle} value={c.value} tone={c.tone} />
                 </div>
               ))}
@@ -228,7 +225,6 @@ function MobileHome(){
         </motion.div>
       </div>
 
-      {/* Тост «Данные обновлены» */}
       <AnimatePresence>
         {flash && (
           <motion.div
@@ -240,7 +236,6 @@ function MobileHome(){
         )}
       </AnimatePresence>
 
-      {/* List (newest first) + highlight for newest */}
       <div ref={listRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
         {visible.map(b=> <BetCard key={b.id} bet={b} highlight={highlightId===b.id} />)}
         {visible.length < bets.length && (
@@ -272,10 +267,10 @@ function SummaryCard({ title, subtitle, value, tone='neutral' }){
       : 'ring-white/10 bg-white/5'
 
   return (
-    <div className={`inline-flex flex-col w-auto max-w-[92vw] rounded-2xl ${toneClasses} p-3 backdrop-blur-md`}>
-      <div className="text-[11px] font-semibold leading-tight whitespace-nowrap">{title}</div>
+    <div className={`w-full rounded-2xl ${toneClasses} p-3 backdrop-blur-md`}>
+      <div className="text-[11px] font-semibold leading-tight">{title}</div>
       <div className="text-[9px] uppercase tracking-wide text-white/70 leading-tight">{subtitle}</div>
-      <div className="text-base font-semibold mt-1 whitespace-nowrap">{value}</div>
+      <div className="text-lg font-semibold mt-1">{value}</div>
     </div>
   )
 }
@@ -300,7 +295,7 @@ function BetCard({ bet, highlight=false }){
           <div className="text-white/85 text-[13px] truncate">{bet.bet}</div>
         </div>
         <div className="text-right shrink-0">
-          <div className="text-sm font-semibold">{bet.coef}</div>
+          <div className="text-sm font-semibold">{fmt2(bet.coef)}</div>
           <div className="text-xs opacity-90">{positive? `+${currency(result)}`: `${currency(result)}`}</div>
         </div>
       </div>
@@ -312,7 +307,7 @@ function BetCard({ bet, highlight=false }){
             <div className="mt-3 text-[12px] font-semibold">Статус: {bet.status}</div>
             <div className="mt-2 grid grid-cols-2 gap-2 text-[13px]">
               <Detail label="Ставка" value={currency(bet.stake_value)} />
-              <Detail label="Коэффициент" value={bet.coef} />
+              <Detail label="Коэффициент" value={fmt2(bet.coef)} />
               <Detail label="Результат" value={currency(result)} />
               <Detail label="ID" value={bet.id} />
             </div>
@@ -340,7 +335,7 @@ function AdminPage(){
   const [password, setPassword] = useState('')
   const [authed, setAuthed] = useState(false)
   const [bets, setBets] = useState([])
-  const [jsonText, setJsonText] = useState('[]')
+  const [jsonText, setJsonText] = useState('') // ПУСТО по дефолту
   const [error, setError] = useState('')
   const [editingId, setEditingId] = useState('')
 
@@ -360,7 +355,11 @@ function AdminPage(){
       .catch(()=>{})
   },[])
 
-  useEffect(()=>{ fetch('/api/bets').then(r=>r.json()).then(d=>{ setBets(d); setJsonText(JSON.stringify(d,null,2)) }) },[])
+  // грузим список ставок, НО НЕ ЗАПОЛНЯЕМ редактор автоматически
+  useEffect(()=>{
+    fetch('/api/bets').then(r=>r.json()).then(d=> setBets(d))
+  },[])
+
   const headers = useMemo(()=> authed? { 'Content-Type':'application/json', 'x-admin-password': password }: {}, [authed, password])
 
   const login = async (e)=>{
@@ -379,14 +378,7 @@ function AdminPage(){
     setAuthed(false); setPassword('')
   }
 
-  const applyReplace = async ()=>{
-    try{
-      const parsed = JSON.parse(jsonText)
-      const r = await fetch('/api/bets', { method:'PUT', headers, body: JSON.stringify(parsed) })
-      if(!r.ok) throw new Error('Ошибка авторизации или данных')
-      setError('')
-    }catch(e){ setError(e.message) }
-  }
+  // УДАЛЕНО: applyReplace (полная замена списка) и кнопка
   const addOne = async ()=>{
     try{
       const obj = JSON.parse(jsonText)
@@ -394,6 +386,7 @@ function AdminPage(){
       const r = await fetch('/api/bets', { method:'POST', headers, body: JSON.stringify(obj) })
       if(!r.ok) throw new Error('Ошибка авторизации или данных')
       setError('')
+      setJsonText('') // очищаем поле после успешного добавления
     }catch(e){ setError(e.message) }
   }
   const del = async (id)=>{
@@ -431,7 +424,7 @@ function AdminPage(){
     if(!r.ok) setError('Ошибка PATCH (проверь пароль)')
   }
 
-  // ===== Импорт JSON =====
+  // ===== Импорт JSON (ТОЛЬКО ДОБАВИТЬ/СМЕРДЖИТЬ) =====
   const onChooseFile = async (e) => {
     const file = e.target.files?.[0]
     if(!file) return
@@ -474,7 +467,6 @@ function AdminPage(){
 
   const importAddMerge = async ()=>{
     if(!importItems.length){ setImportInfo('Сначала выберите JSON-файл'); return }
-    // получаем текущий список, добавляем импорт сверху (сохраняем порядок файла)
     const current = await fetch('/api/bets').then(r=>r.json())
     const merged = [...importItems.slice().reverse(), ...current]
     const r = await fetch('/api/bets', { method:'PUT', headers, body: JSON.stringify(merged) })
@@ -482,17 +474,15 @@ function AdminPage(){
     setImportInfo('Импорт завершён: добавлено ' + importItems.length)
     setImportItems([])
   }
-  const importReplaceAll = async ()=>{
-    if(!importItems.length){ setImportInfo('Сначала выберите JSON-файл'); return }
-    const r = await fetch('/api/bets', { method:'PUT', headers, body: JSON.stringify(importItems.slice().reverse()) })
-    if(!r.ok){ setImportInfo('Ошибка импорта (авторизация?)'); return }
-    setImportInfo('Импорт выполнен (замена): записей ' + importItems.length)
-    setImportItems([])
-  }
+
+  // УДАЛЕНО: importReplaceAll и кнопка «Импортировать (заменить всё)»
 
   useEffect(()=>{
     const socket = io('/', { path: '/socket.io' })
-    socket.on('bets:update', (data)=>{ setBets(Array.isArray(data)?data:(data?.items||[])); if(!editingId) setJsonText(JSON.stringify(Array.isArray(data)?data:(data?.items||[]),null,2)) })
+    socket.on('bets:update', (data)=>{
+      const list = Array.isArray(data) ? data : (data?.items || [])
+      setBets(list)
+    })
     return ()=> socket.disconnect()
   },[editingId])
 
@@ -518,12 +508,12 @@ function AdminPage(){
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
             <div className="bg-white/5 rounded-2xl p-4 ring-1 ring-white/10">
               <div className="text-sm opacity-80 mb-2">Редактор JSON</div>
-              <textarea className="w-full h-[420px] bg-black/40 rounded-xl p-3 font-mono text-sm outline-none" value={jsonText} onChange={(e)=>setJsonText(e.target.value)} spellCheck={false} />
+              <textarea className="w-full h-[420px] bg-black/40 rounded-xl p-3 font-mono text-sm outline-none" value={jsonText} onChange={(e)=>setJsonText(e.target.value)} spellCheck={false} placeholder='Вставьте сюда объект {"id":"...", ...} для добавления или для правки выберите «В редактор» → «Сохранить изменения»' />
               {error && <div className="text-rose-400 text-sm mt-2">{error}</div>}
               <div className="flex flex-wrap gap-3 mt-3">
-                <button onClick={applyReplace} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 font-medium">Заменить список</button>
-                <button onClick={addOne} className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 font-medium">Добавить одну</button>
-                <button onClick={savePatch} className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 font-medium">Сохранить текущую (PATCH)</button>
+                {/* Удалено: «Заменить список» */}
+                <button onClick={addOne} className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 font-medium">Добавить ставку</button>
+                <button onClick={savePatch} className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 font-medium">Сохранить изменения</button>
               </div>
 
               {/* Импорт из JSON документа */}
@@ -533,7 +523,6 @@ function AdminPage(){
                 {importInfo && <div className="text-xs opacity-80 mt-2">{importInfo}</div>}
                 <div className="flex flex-wrap gap-3 mt-3">
                   <button onClick={importAddMerge} className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-sm">Импортировать (добавить)</button>
-                  <button onClick={importReplaceAll} className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-sm">Импортировать (заменить всё)</button>
                 </div>
               </div>
             </div>
