@@ -2,24 +2,37 @@ import React, { useMemo, useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { io } from 'socket.io-client'
 
+// =====================
+// Constants & utils
+// =====================
 const STATUS = { WON: 'Выиграна', LOST: 'Проиграна', PENDING: 'Нерасчитана' }
 const statusColor = (s) => s===STATUS.WON? 'bg-emerald-600' : s===STATUS.LOST? 'bg-rose-600' : 'bg-amber-500'
+
+// Валюта — всегда добавляем слово "рублей"
 const currency = (v) => `${v} рублей`
 
+// Нормализуем результат ставки
 function normalizedWinValue(b){
   const win = Number(b.win_value) || 0
   const stake = Number(b.stake_value) || 0
-  if (b.status === STATUS.LOST) return win < 0 ? win : (stake ? -stake : 0)
-  if (b.status === STATUS.PENDING) return 0
+  if (b.status === STATUS.LOST){
+    return win < 0 ? win : (stake ? -stake : 0)
+  }
+  if (b.status === STATUS.PENDING){
+    return 0
+  }
   return win
 }
 
+// =====================
+// Minimal router (path-based)
+// =====================
 const usePath = () => {
   const [path, setPath] = useState(window.location.pathname)
   useEffect(()=>{
-    const onPop = ()=> setPath(window.location.pathname)
+    const onPop = () => setPath(window.location.pathname)
     window.addEventListener('popstate', onPop)
-    return ()=> window.removeEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
   },[])
   return [path, (p)=>{ window.history.pushState({}, '', p); setPath(p)}]
 }
@@ -30,58 +43,119 @@ export default function App(){
   return <MobileHome />
 }
 
-async function fetchBets(){ const r = await fetch('/api/bets'); return await r.json() }
+// =====================
+// Data layer + realtime status (persist last updated to localStorage)
+// =====================
+async function fetchBets(){
+  const r = await fetch('/api/bets')
+  return await r.json()
+}
+
+// получить серверный штамп последнего обновления (независимо от браузера)
+async function fetchMeta(){
+  try{
+    const r = await fetch('/api/meta')
+    if(!r.ok) return 0
+    const j = await r.json()
+    return Number(j.updatedAt)||0
+  }catch{ return 0 }
+}
 
 function useRealtimeBets(){
   const [bets, setBets] = useState([])
   const [connected, setConnected] = useState(false)
-  const [lastEventAt, setLastEventAt] = useState(()=> Number(localStorage.getItem('betoff_last_update')||0) || 0)
-  const listRef = useRef(null)
+  const [lastEventAt, setLastEventAt] = useState(()=>{
+    const saved = Number(localStorage.getItem('betoff_last_update')||0)
+    return saved || 0
+  })
+
   useEffect(()=>{
     let mounted = true
-    fetchBets().then(d=> mounted && setBets(d))
+    // первичная загрузка: тянем список и серверный updatedAt
+    fetchBets().then(d=> { if(mounted) setBets(d) })
+    fetchMeta().then(ts=> { if(mounted && ts) setLastEventAt(ts) })
+
     const socket = io('/', { path: '/socket.io' })
     socket.on('connect', ()=> setConnected(true))
     socket.on('disconnect', ()=> setConnected(false))
-    socket.on('bets:update', (data)=>{
-      setBets(data)
+
+    // поддержка старого и нового формата события
+    socket.on('bets:update', (payload)=>{
+      if(Array.isArray(payload)){
+        setBets(payload)
+        fetchMeta().then(ts=> { if(ts) setLastEventAt(ts) })
+      }else if(payload && typeof payload==='object'){
+        setBets(payload.items || [])
+        const ts = Number(payload.updatedAt)||Date.now()
+        setLastEventAt(ts)
+        try{ localStorage.setItem('betoff_last_update', String(ts)) }catch{}
+        return
+      }
       const now = Date.now()
       setLastEventAt(now)
       try{ localStorage.setItem('betoff_last_update', String(now)) }catch{}
-      try{ listRef.current?.scrollTo({ top: 0, behavior: 'smooth' }) }catch{}
     })
-    return ()=> socket.disconnect()
+    return ()=> { mounted=false; socket.disconnect() }
   },[])
-  return { bets, setBets, connected, lastEventAt, listRef }
+  return { bets, setBets, connected, lastEventAt }
 }
 
 function calcStats(bets){
-  const settled = bets.filter(b=> b.status !== STATUS.PENDING)
-  const total = settled.length
-  const won = settled.filter(b=>b.status===STATUS.WON).length
+  const total = bets.length
+  const won = bets.filter(b=>b.status===STATUS.WON).length
   const winRate = total? Math.round(won/total*100):0
-  const profit = settled.reduce((a,b)=> a + normalizedWinValue(b), 0)
-  const sumStakes = settled.reduce((a,b)=> a + (Number(b.stake_value)||0), 0)
+  const profit = bets.reduce((a,b)=> a + normalizedWinValue(b), 0)
+  const sumStakes = bets.reduce((a,b)=> a + (Number(b.stake_value)||0), 0)
   const roi = sumStakes? ((profit / sumStakes) * 100).toFixed(1) : '0.0'
-  const avgOdds = total? (settled.reduce((a,b)=> a+(Number(b.coef)||0),0)/total).toFixed(2):0
+  const avgOdds = total? (bets.reduce((a,b)=> a+(Number(b.coef)||0),0)/total).toFixed(2):0
   return { total, winRate, profit, avgOdds, roi }
 }
 
 function calcStreak(bets){
-  const slice = bets.slice(0, 15).filter(b=> b.status !== STATUS.PENDING)
+  const slice = bets.slice(0, 15)
   if (!slice.length) return { kind: 'нет', count: 0 }
-  const target = slice[0].status
+  const first = slice[0]
+  if (first.status === STATUS.PENDING) return { kind: 'нет', count: 0 }
+  const target = first.status
   let count = 0
-  for (const b of slice){ if (b.status !== target) break; count++ }
-  return { kind: target===STATUS.WON ? 'побед' : 'поражений', count }
+  for (const b of slice){
+    if (b.status !== target) break
+    count++
+  }
+  return { kind: target===STATUS.WON? 'побед' : 'поражений', count }
 }
 
+// =====================
+// Mobile Home — horizontal scrollable top metrics (Winrate/Profit/Streak)
+// =====================
 function MobileHome(){
-  const { bets, connected, lastEventAt, listRef } = useRealtimeBets()
+  const { bets, connected, lastEventAt } = useRealtimeBets()
   const [limit, setLimit] = useState(20)
   const [flash, setFlash] = useState(false)
-  useEffect(()=>{ if(!lastEventAt) return; setFlash(true); const t=setTimeout(()=>setFlash(false),900); return ()=>clearTimeout(t) },[lastEventAt])
+  const [highlightId, setHighlightId] = useState('')
+  const listRef = useRef(null)
+  const prevFirstId = useRef('')
 
+  // summary carousel state
+  const scrollerRef = useRef(null)
+
+  // короткая вспышка при любом апдейте + подсветка и автоскролл при добавлении новой первой
+  useEffect(()=>{
+    if(!lastEventAt) return
+    setFlash(true)
+    const t = setTimeout(()=> setFlash(false), 900)
+    const firstId = bets?.[0]?.id || ''
+    if (firstId && firstId !== prevFirstId.current){
+      setHighlightId(firstId)
+      prevFirstId.current = firstId
+      const el = listRef.current
+      if (el) try { el.scrollTo({ top: 0, behavior: 'smooth' }) } catch { el.scrollTop = 0 }
+      setTimeout(()=> setHighlightId(''), 2500)
+    }
+    return ()=> clearTimeout(t)
+  }, [lastEventAt])
+
+  // вычисления
   const last15 = useMemo(()=> bets.slice(0, 15), [bets])
   const stats15 = useMemo(()=> calcStats(last15), [last15])
   const streak = useMemo(()=> calcStreak(bets), [bets])
@@ -89,8 +163,16 @@ function MobileHome(){
 
   const winrateTone = stats15.winRate > 50 ? 'green' : 'red'
   const profitTone = stats15.profit > 0 ? 'green' : (stats15.profit < 0 ? 'red' : 'neutral')
-  const dateLabel = useMemo(()=> lastEventAt? new Date(lastEventAt).toLocaleDateString('ru-RU',{day:'numeric',month:'long'}) : '—', [lastEventAt])
 
+  // Новая логика "обновлено": только два статуса
+  const dateLabel = useMemo(()=>{
+    const ts = Number(lastEventAt)||0
+    if(!ts) return 'сегодня'
+    const delta = Date.now() - ts
+    return delta <= 30*60*1000 ? 'только что' : 'сегодня'
+  }, [lastEventAt])
+
+  // items for carousel
   const metricCards = [
     { key:'wr', title:'Винрейт', subtitle:'за последние 15 ставок', value:`${stats15.winRate}%`, tone:winrateTone },
     { key:'pf', title:'Профит', subtitle:'за последние 15 ставок', value:`${stats15.profit} рублей`, tone:profitTone },
@@ -99,6 +181,7 @@ function MobileHome(){
 
   return (
     <div className="min-h-screen bg-neutral-950 text-white flex flex-col">
+      {/* Branding + LIVE индикатор + дата обновления (сохраняется) */}
       <div className="px-4 pt-4 pb-2">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -111,17 +194,32 @@ function MobileHome(){
               </div>
             </div>
           </div>
-          <a href="https://t.me/betoff7" target="_blank" rel="noreferrer" className="text-xs px-3 py-2 rounded-xl bg-white/10 hover:bg-white/15 whitespace-nowrap">t.me/betoff7</a>
+          <a
+            href="https://t.me/betoff7"
+            target="_blank"
+            rel="noreferrer"
+            className="text-xs px-3 py-2 rounded-xl bg-white/10 hover:bg-white/15 whitespace-nowrap"
+          >t.me/betoff7</a>
         </div>
-        <motion.div className="mt-3 h-[2px] bg-gradient-to-r from-emerald-400/0 via-emerald-400/80 to-emerald-400/0" animate={{ x: [ '-100%', '100%' ] }} transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }} />
+        {/* бегущая линия под шапкой */}
+        <motion.div
+          className="mt-3 h-[2px] bg-gradient-to-r from-emerald-400/0 via-emerald-400/80 to-emerald-400/0"
+          animate={{ x: [ '-100%', '100%' ] }}
+          transition={{ duration: 2.5, repeat: Infinity, ease: 'linear' }}
+        />
       </div>
 
+      {/* Summary — горизонтальный слайдер c компактными карточками */}
       <div className="px-0 mb-1">
-        <motion.div className="relative" animate={flash? { scale: [1, 1.02, 1] } : {}} transition={{ duration: 0.6 }}>
-          <div className="no-scrollbar overflow-x-auto snap-x snap-mandatory">
+        <motion.div
+          className="relative"
+          animate={flash? { scale: [1, 1.02, 1] } : {}}
+          transition={{ duration: 0.6 }}
+        >
+          <div ref={scrollerRef} className="no-scrollbar overflow-x-auto snap-x snap-mandatory">
             <div className="flex gap-3 px-3">
               {metricCards.map((c)=> (
-                <div key={c.key} className="shrink-0 snap-center w-[78%] max-w-[360px]">
+                <div key={c.key} className="shrink-0 snap-start">
                   <SummaryCard title={c.title} subtitle={c.subtitle} value={c.value} tone={c.tone} />
                 </div>
               ))}
@@ -130,14 +228,21 @@ function MobileHome(){
         </motion.div>
       </div>
 
+      {/* Тост «Данные обновлены» */}
       <AnimatePresence>
         {flash && (
-          <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="pointer-events-none fixed top-2 left-1/2 -translate-x-1/2 z-50 px-3 py-1 rounded-full bg-emerald-500/90 text-white text-xs">Данные обновлены</motion.div>
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="pointer-events-none fixed top-2 left-1/2 -translate-x-1/2 z-50 px-3 py-1 rounded-full bg-emerald-500/90 text-white text-xs"
+          >Данные обновлены</motion.div>
         )}
       </AnimatePresence>
 
+      {/* List (newest first) + highlight for newest */}
       <div ref={listRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
-        {visible.map(b=> <BetCard key={b.id} bet={b} />)}
+        {visible.map(b=> <BetCard key={b.id} bet={b} highlight={highlightId===b.id} />)}
         {visible.length < bets.length && (
           <button onClick={()=>setLimit(l=>l+20)} className="w-full mt-1 mb-6 py-2 rounded-xl bg-white/10 hover:bg-white/15 text-sm">Показать ещё</button>
         )}
@@ -149,30 +254,46 @@ function MobileHome(){
 function LiveDot({ on }){
   return (
     <div className="relative inline-flex items-center">
-      <motion.span className={`inline-block w-2 h-2 rounded-full ${on? 'bg-emerald-400':'bg-rose-400'}`} animate={on? { scale: [1, 1.3, 1], opacity: [1, 0.7, 1] } : {}} transition={{ duration: 1.2, repeat: Infinity }} />
+      <motion.span
+        className={`inline-block w-2 h-2 rounded-full ${on? 'bg-emerald-400':'bg-rose-400'}`}
+        animate={on? { scale: [1, 1.3, 1], opacity: [1, 0.7, 1] } : {}}
+        transition={{ duration: 1.2, repeat: Infinity }}
+      />
       <span className="ml-1 text-[10px] uppercase tracking-wide opacity-70">{on? 'LIVE':'OFFLINE'}</span>
     </div>
   )
 }
 
 function SummaryCard({ title, subtitle, value, tone='neutral' }){
-  const toneClasses = tone==='green' ? 'ring-emerald-500/40 bg-emerald-500/10' : tone==='red' ? 'ring-rose-500/40 bg-rose-500/10' : 'ring-white/10 bg-white/5'
+  const toneClasses = tone==='green'
+    ? 'ring-emerald-500/40 bg-emerald-500/10'
+    : tone==='red'
+      ? 'ring-rose-500/40 bg-rose-500/10'
+      : 'ring-white/10 bg-white/5'
+
   return (
-    <div className={`w-full rounded-2xl ${toneClasses} p-3 backdrop-blur-md`}>
-      <div className="text-[11px] font-semibold leading-tight">{title}</div>
+    <div className={`inline-flex flex-col w-auto max-w-[92vw] rounded-2xl ${toneClasses} p-3 backdrop-blur-md`}>
+      <div className="text-[11px] font-semibold leading-tight whitespace-nowrap">{title}</div>
       <div className="text-[9px] uppercase tracking-wide text-white/70 leading-tight">{subtitle}</div>
-      <div className="text-lg font-semibold mt-1">{value}</div>
+      <div className="text-base font-semibold mt-1 whitespace-nowrap">{value}</div>
     </div>
   )
 }
 
-function BetCard({ bet }){
+function BetCard({ bet, highlight=false }){
   const [open, setOpen] = useState(false)
   const bg = statusColor(bet.status)
   const result = normalizedWinValue(bet)
   const positive = result > 0
   return (
-    <motion.div layout onClick={()=>setOpen(v=>!v)} className={`rounded-2xl ${bg} text-white px-4 py-3 shadow-lg cursor-pointer select-none`}>
+    <motion.div
+      layout
+      onClick={()=>setOpen(v=>!v)}
+      className={`rounded-2xl ${bg} text-white px-4 py-3 shadow-lg cursor-pointer select-none`}
+      animate={highlight? { boxShadow: ['0 0 0 0 rgba(255,255,255,0.0)','0 0 0 8px rgba(255,255,255,0.25)','0 0 0 0 rgba(255,255,255,0.0)'] } : {}}
+      transition={highlight? { duration: 2.2, ease: 'easeInOut' } : {}}
+    >
+      {/* Свернуто (без текста статуса) */}
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
           <div className="font-semibold truncate text-[15px]">{bet.match}</div>
@@ -183,6 +304,8 @@ function BetCard({ bet }){
           <div className="text-xs opacity-90">{positive? `+${currency(result)}`: `${currency(result)}`}</div>
         </div>
       </div>
+
+      {/* Раскрыто (здесь уже показываем статус) */}
       <AnimatePresence initial={false}>
         {open && (
           <motion.div key="x" initial={{height:0, opacity:0}} animate={{height:'auto', opacity:1}} exit={{height:0, opacity:0}} transition={{duration:0.2}} className="overflow-hidden">
@@ -210,6 +333,9 @@ function Detail({ label, value }){
   )
 }
 
+// =====================
+// Admin page — persistent auth + quick status + bulk JSON import
+// =====================
 function AdminPage(){
   const [password, setPassword] = useState('')
   const [authed, setAuthed] = useState(false)
@@ -218,16 +344,20 @@ function AdminPage(){
   const [error, setError] = useState('')
   const [editingId, setEditingId] = useState('')
 
+  // импорт JSON
   const [importItems, setImportItems] = useState([])
   const [importInfo, setImportInfo] = useState('')
 
+  // автологин из localStorage с проверкой пароля на сервере
   useEffect(()=>{
     const saved = localStorage.getItem('betoff_admin_pw')
-    if(saved){
-      fetch('/api/auth/check', { headers: { 'x-admin-password': saved } })
-        .then(r=> r.ok ? (setPassword(saved), setAuthed(true)) : localStorage.removeItem('betoff_admin_pw'))
-        .catch(()=>{})
-    }
+    if(!saved) return
+    fetch('/api/auth/check', { headers: { 'x-admin-password': saved } })
+      .then(r=>{
+        if(r.ok){ setPassword(saved); setAuthed(true) }
+        else { localStorage.removeItem('betoff_admin_pw') }
+      })
+      .catch(()=>{})
   },[])
 
   useEffect(()=>{ fetch('/api/bets').then(r=>r.json()).then(d=>{ setBets(d); setJsonText(JSON.stringify(d,null,2)) }) },[])
@@ -244,7 +374,10 @@ function AdminPage(){
     }catch(_){ setError('Сеть недоступна'); }
   }
 
-  const logout = ()=>{ localStorage.removeItem('betoff_admin_pw'); setAuthed(false); setPassword('') }
+  const logout = ()=>{
+    localStorage.removeItem('betoff_admin_pw')
+    setAuthed(false); setPassword('')
+  }
 
   const applyReplace = async ()=>{
     try{
@@ -267,7 +400,10 @@ function AdminPage(){
     const r = await fetch(`/api/bets/${id}`, { method:'DELETE', headers })
     if(!r.ok) setError('Ошибка авторизации')
   }
-  const loadToEditor = (b)=>{ setEditingId(String(b.id)); setJsonText(JSON.stringify(b, null, 2)) }
+  const loadToEditor = (b)=>{
+    setEditingId(String(b.id))
+    setJsonText(JSON.stringify(b, null, 2))
+  }
   const savePatch = async ()=>{
     if(!editingId){ setError('Сначала выберите ставку «В редактор»'); return }
     try{
@@ -278,6 +414,7 @@ function AdminPage(){
     }catch(e){ setError(e.message) }
   }
 
+  // Быстрые кнопки смены статуса с автоподстановкой win_value
   const quickStatus = async (b, to) => {
     const stake = Number(b.stake_value)||0
     const coef = Number(b.coef)||0
@@ -294,6 +431,7 @@ function AdminPage(){
     if(!r.ok) setError('Ошибка PATCH (проверь пароль)')
   }
 
+  // ===== Импорт JSON =====
   const onChooseFile = async (e) => {
     const file = e.target.files?.[0]
     if(!file) return
@@ -309,6 +447,7 @@ function AdminPage(){
       setImportInfo('Ошибка импорта: ' + (err?.message||''))
     }
   }
+
   function normalizeImportedBet(b){
     const status = [STATUS.WON, STATUS.LOST, STATUS.PENDING].includes(b.status) ? b.status : STATUS.PENDING
     const stake = Number(b.stake_value)||0
@@ -332,8 +471,10 @@ function AdminPage(){
       win_currency: b.win_currency || 'RUB'
     }
   }
+
   const importAddMerge = async ()=>{
     if(!importItems.length){ setImportInfo('Сначала выберите JSON-файл'); return }
+    // получаем текущий список, добавляем импорт сверху (сохраняем порядок файла)
     const current = await fetch('/api/bets').then(r=>r.json())
     const merged = [...importItems.slice().reverse(), ...current]
     const r = await fetch('/api/bets', { method:'PUT', headers, body: JSON.stringify(merged) })
@@ -351,17 +492,17 @@ function AdminPage(){
 
   useEffect(()=>{
     const socket = io('/', { path: '/socket.io' })
-    socket.on('bets:update', (data)=>{ setBets(data); if(!editingId) setJsonText(JSON.stringify(data,null,2)) })
+    socket.on('bets:update', (data)=>{ setBets(Array.isArray(data)?data:(data?.items||[])); if(!editingId) setJsonText(JSON.stringify(Array.isArray(data)?data:(data?.items||[]),null,2)) })
     return ()=> socket.disconnect()
   },[editingId])
 
   return (
     <div className="min-h-screen bg-neutral-950 text-white">
       <div className="max-w-6xl mx-auto px-6 py-6">
-        <div className="flex items-center justify_between">
+        <div className="flex items-center justify-between">
           <h1 className="text-2xl font-semibold">Админ-панель</h1>
           <div className="flex items-center gap-2">
-            {authed && <button onClick={logout} className="px-3 py-1 rounded-lg bg_white/10 hover:bg_white/15">Выйти</button>}
+            {authed && <button onClick={logout} className="px-3 py-1 rounded-lg bg-white/10 hover:bg-white/15">Выйти</button>}
             <a href="/" className="px-3 py-1 rounded-lg bg-white/10 hover:bg-white/15">← На сайт</a>
           </div>
         </div>
@@ -385,6 +526,7 @@ function AdminPage(){
                 <button onClick={savePatch} className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 font-medium">Сохранить текущую (PATCH)</button>
               </div>
 
+              {/* Импорт из JSON документа */}
               <div className="mt-6 border-t border-white/10 pt-4">
                 <div className="text-sm opacity-80 mb-2">Импорт из JSON (массовое добавление)</div>
                 <input type="file" accept="application/json" onChange={onChooseFile} className="block text-sm" />
@@ -426,6 +568,7 @@ function AdminPage(){
   )
 }
 
+// hide scrollbars util (for mobile)
 const style = document.createElement('style')
 style.innerHTML = `.no-scrollbar::-webkit-scrollbar{display:none}.no-scrollbar{-ms-overflow-style:none;scrollbar-width:none}`
 document.head.appendChild(style)
