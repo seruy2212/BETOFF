@@ -8,14 +8,9 @@ import { io } from 'socket.io-client'
 const STATUS = { WON: 'Выиграна', LOST: 'Проиграна', PENDING: 'Нерасчитана' }
 const statusColor = (s) => s===STATUS.WON? 'bg-emerald-600' : s===STATUS.LOST? 'bg-rose-600' : 'bg-amber-500'
 
-// Формат до 2 знаков после запятой
-const fmt2 = (n) => {
-  const x = Number(n)
-  if (!isFinite(x)) return String(n ?? '')
-  return x.toLocaleString('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
-}
-
-// Валюта — добавляем "рублей" + формат до 2 знаков
+// формат чисел до 2 знаков
+const nf2 = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
+const fmt2 = (n) => nf2.format(Number(n) || 0)
 const currency = (v) => `${fmt2(v)} рублей`
 
 // Нормализуем результат ставки
@@ -58,6 +53,7 @@ async function fetchBets(){
   return await r.json()
 }
 
+// получить серверный штамп последнего обновления (независимо от браузера)
 async function fetchMeta(){
   try{
     const r = await fetch('/api/meta')
@@ -77,6 +73,7 @@ function useRealtimeBets(){
 
   useEffect(()=>{
     let mounted = true
+    // первичная загрузка: тянем список и серверный updatedAt
     fetchBets().then(d=> { if(mounted) setBets(d) })
     fetchMeta().then(ts=> { if(mounted && ts) setLastEventAt(ts) })
 
@@ -84,6 +81,7 @@ function useRealtimeBets(){
     socket.on('connect', ()=> setConnected(true))
     socket.on('disconnect', ()=> setConnected(false))
 
+    // поддержка старого и нового формата события
     socket.on('bets:update', (payload)=>{
       if(Array.isArray(payload)){
         setBets(payload)
@@ -104,25 +102,30 @@ function useRealtimeBets(){
   return { bets, setBets, connected, lastEventAt }
 }
 
+// === Статы: исключаем НЕРАСЧИТАННЫЕ из винрейта и профита ===
 function calcStats(bets){
-  const total = bets.length
-  const won = bets.filter(b=>b.status===STATUS.WON).length
+  const eligible = bets.filter(b => b.status !== STATUS.PENDING)
+  const total = eligible.length
+  const won = eligible.filter(b=>b.status===STATUS.WON).length
   const winRate = total? Math.round(won/total*100):0
-  const profit = bets.reduce((a,b)=> a + normalizedWinValue(b), 0)
-  const sumStakes = bets.reduce((a,b)=> a + (Number(b.stake_value)||0), 0)
+
+  const profit = eligible.reduce((a,b)=> a + normalizedWinValue(b), 0)
+  const sumStakes = eligible.reduce((a,b)=> a + (Number(b.stake_value)||0), 0)
   const roi = sumStakes? ((profit / sumStakes) * 100).toFixed(1) : '0.0'
-  const avgOdds = total? (bets.reduce((a,b)=> a+(Number(b.coef)||0),0)/total).toFixed(2):0
+  const avgOdds = total? (eligible.reduce((a,b)=> a+(Number(b.coef)||0),0)/total).toFixed(2):0
   return { total, winRate, profit, avgOdds, roi }
 }
 
-function calcStreak(bets){
-  const slice = bets.slice(0, 15)
-  if (!slice.length) return { kind: 'нет', count: 0 }
-  const first = slice[0]
-  if (first.status === STATUS.PENDING) return { kind: 'нет', count: 0 }
-  const target = first.status
+// === Серия: ищем первую НЕ нерасчитанную и считаем подряд ===
+function calcStreak(all){
+  const slice = all.slice(0, 15)
+  const firstIdx = slice.findIndex(b => b.status !== STATUS.PENDING)
+  if (firstIdx === -1) return { kind: 'нет', count: 0 }
+  const target = slice[firstIdx].status
   let count = 0
-  for (const b of slice){
+  for (let i = firstIdx; i < slice.length; i++){
+    const b = slice[i]
+    if (b.status === STATUS.PENDING) continue
     if (b.status !== target) break
     count++
   }
@@ -140,8 +143,10 @@ function MobileHome(){
   const listRef = useRef(null)
   const prevFirstId = useRef('')
 
+  // summary carousel state
   const scrollerRef = useRef(null)
 
+  // короткая вспышка при любом апдейте + подсветка и автоскролл при добавлении новой первой
   useEffect(()=>{
     if(!lastEventAt) return
     setFlash(true)
@@ -157,6 +162,7 @@ function MobileHome(){
     return ()=> clearTimeout(t)
   }, [lastEventAt])
 
+  // вычисления
   const last15 = useMemo(()=> bets.slice(0, 15), [bets])
   const stats15 = useMemo(()=> calcStats(last15), [last15])
   const streak = useMemo(()=> calcStreak(bets), [bets])
@@ -165,14 +171,15 @@ function MobileHome(){
   const winrateTone = stats15.winRate > 50 ? 'green' : 'red'
   const profitTone = stats15.profit > 0 ? 'green' : (stats15.profit < 0 ? 'red' : 'neutral')
 
-  // Новая логика «обновлено»: только «только что» (≤30 мин) или «сегодня»
   const dateLabel = useMemo(()=>{
-    const ts = Number(lastEventAt)||0
-    if(!ts) return 'сегодня'
-    const delta = Date.now() - ts
-    return delta <= 30*60*1000 ? 'только что' : 'сегодня'
+    if(!lastEventAt) return '—'
+    const delta = Date.now() - Number(lastEventAt)
+    if(delta <= 30*60*1000) return 'только что'
+    if(delta <= 24*60*60*1000) return 'недавно'
+    try{ return new Date(Number(lastEventAt)).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' }) }catch{ return 'недавно' }
   }, [lastEventAt])
 
+  // items for carousel
   const metricCards = [
     { key:'wr', title:'Винрейт', subtitle:'за последние 15 ставок', value:`${stats15.winRate}%`, tone:winrateTone },
     { key:'pf', title:'Профит', subtitle:'за последние 15 ставок', value:`${fmt2(stats15.profit)} рублей`, tone:profitTone },
@@ -181,6 +188,7 @@ function MobileHome(){
 
   return (
     <div className="min-h-screen bg-neutral-950 text-white flex flex-col">
+      {/* Branding + LIVE индикатор + дата обновления (сохраняется) */}
       <div className="px-4 pt-4 pb-2">
         <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
@@ -200,6 +208,7 @@ function MobileHome(){
             className="text-xs px-3 py-2 rounded-xl bg-white/10 hover:bg-white/15 whitespace-nowrap"
           >t.me/betoff7</a>
         </div>
+        {/* бегущая линия под шапкой */}
         <motion.div
           className="mt-3 h-[2px] bg-gradient-to-r from-emerald-400/0 via-emerald-400/80 to-emerald-400/0"
           animate={{ x: [ '-100%', '100%' ] }}
@@ -207,6 +216,7 @@ function MobileHome(){
         />
       </div>
 
+      {/* Summary — горизонтальный слайдер, КОМПАКТНЫЕ карточки контентной ширины */}
       <div className="px-0 mb-1">
         <motion.div
           className="relative"
@@ -216,7 +226,7 @@ function MobileHome(){
           <div ref={scrollerRef} className="no-scrollbar overflow-x-auto snap-x snap-mandatory">
             <div className="flex gap-3 px-3">
               {metricCards.map((c)=> (
-                <div key={c.key} className="shrink-0 snap-center w-[78%] max-w-[360px]">
+                <div key={c.key} className="shrink-0 snap-center">
                   <SummaryCard title={c.title} subtitle={c.subtitle} value={c.value} tone={c.tone} />
                 </div>
               ))}
@@ -225,6 +235,7 @@ function MobileHome(){
         </motion.div>
       </div>
 
+      {/* Тост «Данные обновлены» */}
       <AnimatePresence>
         {flash && (
           <motion.div
@@ -236,6 +247,7 @@ function MobileHome(){
         )}
       </AnimatePresence>
 
+      {/* List (newest first) + highlight for newest */}
       <div ref={listRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
         {visible.map(b=> <BetCard key={b.id} bet={b} highlight={highlightId===b.id} />)}
         {visible.length < bets.length && (
@@ -266,11 +278,12 @@ function SummaryCard({ title, subtitle, value, tone='neutral' }){
       ? 'ring-rose-500/40 bg-rose-500/10'
       : 'ring-white/10 bg-white/5'
 
+  // Карточка контентной ширины (минимум 140px), не растягиваем на всю
   return (
-    <div className={`w-full rounded-2xl ${toneClasses} p-3 backdrop-blur-md`}>
+    <div className={`inline-flex flex-col items-start rounded-2xl ${toneClasses} px-3 py-2 backdrop-blur-md min-w-[140px] max-w-[92vw]`}>
       <div className="text-[11px] font-semibold leading-tight">{title}</div>
       <div className="text-[9px] uppercase tracking-wide text-white/70 leading-tight">{subtitle}</div>
-      <div className="text-lg font-semibold mt-1">{value}</div>
+      <div className="text-lg font-semibold mt-1 whitespace-nowrap">{value}</div>
     </div>
   )
 }
@@ -295,7 +308,7 @@ function BetCard({ bet, highlight=false }){
           <div className="text-white/85 text-[13px] truncate">{bet.bet}</div>
         </div>
         <div className="text-right shrink-0">
-          <div className="text-sm font-semibold">{fmt2(bet.coef)}</div>
+          <div className="text-sm font-semibold">{bet.coef}</div>
           <div className="text-xs opacity-90">{positive? `+${currency(result)}`: `${currency(result)}`}</div>
         </div>
       </div>
@@ -307,7 +320,7 @@ function BetCard({ bet, highlight=false }){
             <div className="mt-3 text-[12px] font-semibold">Статус: {bet.status}</div>
             <div className="mt-2 grid grid-cols-2 gap-2 text-[13px]">
               <Detail label="Ставка" value={currency(bet.stake_value)} />
-              <Detail label="Коэффициент" value={fmt2(bet.coef)} />
+              <Detail label="Коэффициент" value={bet.coef} />
               <Detail label="Результат" value={currency(result)} />
               <Detail label="ID" value={bet.id} />
             </div>
@@ -335,7 +348,7 @@ function AdminPage(){
   const [password, setPassword] = useState('')
   const [authed, setAuthed] = useState(false)
   const [bets, setBets] = useState([])
-  const [jsonText, setJsonText] = useState('') // ПУСТО по дефолту
+  const [jsonText, setJsonText] = useState('') // пусто по умолчанию
   const [error, setError] = useState('')
   const [editingId, setEditingId] = useState('')
 
@@ -355,11 +368,7 @@ function AdminPage(){
       .catch(()=>{})
   },[])
 
-  // грузим список ставок, НО НЕ ЗАПОЛНЯЕМ редактор автоматически
-  useEffect(()=>{
-    fetch('/api/bets').then(r=>r.json()).then(d=> setBets(d))
-  },[])
-
+  useEffect(()=>{ fetch('/api/bets').then(r=>r.json()).then(d=>{ setBets(d) }) },[])
   const headers = useMemo(()=> authed? { 'Content-Type':'application/json', 'x-admin-password': password }: {}, [authed, password])
 
   const login = async (e)=>{
@@ -378,7 +387,6 @@ function AdminPage(){
     setAuthed(false); setPassword('')
   }
 
-  // УДАЛЕНО: applyReplace (полная замена списка) и кнопка
   const addOne = async ()=>{
     try{
       const obj = JSON.parse(jsonText)
@@ -386,12 +394,13 @@ function AdminPage(){
       const r = await fetch('/api/bets', { method:'POST', headers, body: JSON.stringify(obj) })
       if(!r.ok) throw new Error('Ошибка авторизации или данных')
       setError('')
-      setJsonText('') // очищаем поле после успешного добавления
     }catch(e){ setError(e.message) }
   }
   const del = async (id)=>{
     const r = await fetch(`/api/bets/${id}`, { method:'DELETE', headers })
-    if(!r.ok) setError('Ошибка авторизации')
+    if(!r.ok){ setError('Ошибка авторизации'); return }
+    // оптимистично обновим список локально (чтобы не было «тёмного» состояния при задержке сокета)
+    setBets(prev => prev.filter(x => String(x.id) !== String(id)))
   }
   const loadToEditor = (b)=>{
     setEditingId(String(b.id))
@@ -424,7 +433,7 @@ function AdminPage(){
     if(!r.ok) setError('Ошибка PATCH (проверь пароль)')
   }
 
-  // ===== Импорт JSON (ТОЛЬКО ДОБАВИТЬ/СМЕРДЖИТЬ) =====
+  // ===== Импорт JSON (только добавление) =====
   const onChooseFile = async (e) => {
     const file = e.target.files?.[0]
     if(!file) return
@@ -467,6 +476,7 @@ function AdminPage(){
 
   const importAddMerge = async ()=>{
     if(!importItems.length){ setImportInfo('Сначала выберите JSON-файл'); return }
+    // получаем текущий список, добавляем импорт сверху (сохраняем порядок файла)
     const current = await fetch('/api/bets').then(r=>r.json())
     const merged = [...importItems.slice().reverse(), ...current]
     const r = await fetch('/api/bets', { method:'PUT', headers, body: JSON.stringify(merged) })
@@ -475,13 +485,12 @@ function AdminPage(){
     setImportItems([])
   }
 
-  // УДАЛЕНО: importReplaceAll и кнопка «Импортировать (заменить всё)»
-
   useEffect(()=>{
     const socket = io('/', { path: '/socket.io' })
     socket.on('bets:update', (data)=>{
-      const list = Array.isArray(data) ? data : (data?.items || [])
-      setBets(list)
+      const items = Array.isArray(data) ? data : (data?.items || [])
+      setBets(items)
+      if(!editingId) setJsonText('')
     })
     return ()=> socket.disconnect()
   },[editingId])
@@ -508,15 +517,14 @@ function AdminPage(){
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
             <div className="bg-white/5 rounded-2xl p-4 ring-1 ring-white/10">
               <div className="text-sm opacity-80 mb-2">Редактор JSON</div>
-              <textarea className="w-full h-[420px] bg-black/40 rounded-xl p-3 font-mono text-sm outline-none" value={jsonText} onChange={(e)=>setJsonText(e.target.value)} spellCheck={false} placeholder='Вставьте сюда объект {"id":"...", ...} для добавления или для правки выберите «В редактор» → «Сохранить изменения»' />
+              <textarea className="w-full h-[420px] bg-black/40 rounded-xl p-3 font-mono text-sm outline-none" value={jsonText} onChange={(e)=>setJsonText(e.target.value)} spellCheck={false} placeholder='Вставьте сюда объект {"…"} для "Добавить ставку" или "Сохранить изменения"' />
               {error && <div className="text-rose-400 text-sm mt-2">{error}</div>}
               <div className="flex flex-wrap gap-3 mt-3">
-                {/* Удалено: «Заменить список» */}
                 <button onClick={addOne} className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 font-medium">Добавить ставку</button>
                 <button onClick={savePatch} className="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 font-medium">Сохранить изменения</button>
               </div>
 
-              {/* Импорт из JSON документа */}
+              {/* Импорт из JSON документа (только добавление) */}
               <div className="mt-6 border-t border-white/10 pt-4">
                 <div className="text-sm opacity-80 mb-2">Импорт из JSON (массовое добавление)</div>
                 <input type="file" accept="application/json" onChange={onChooseFile} className="block text-sm" />
